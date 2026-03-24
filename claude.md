@@ -4,7 +4,7 @@
 
 ## Overview
 
-A Python-based music listening history tracker that integrates with Last.fm API to collect, store, and analyze listening data for recommendation system research. Designed with future Spotify API integration in mind.
+A Python-based music listening history tracker that integrates with Last.fm and Spotify APIs to collect, store, and analyze listening data for recommendation system research. Includes real Spotify integration for playlist creation and track popularity data.
 
 ## Tech Stack
 
@@ -14,6 +14,8 @@ A Python-based music listening history tracker that integrates with Last.fm API 
 | Database | SQLite | Portable, zero-config, single-file storage |
 | Background Jobs | APScheduler | Pure Python, persistent job store, Flask integration |
 | HTTP Client | requests | Simple, well-documented, industry standard |
+| Spotify API | spotipy | OAuth, search, playlist creation, popularity data |
+| Environment | python-dotenv | Secure credential management via .env |
 | Frontend | Vanilla HTML/CSS/JS | No build step, simple deployment |
 
 ## Project Structure
@@ -31,7 +33,7 @@ lastfm-tracker/
 ├── enhanced_sync_service.py # Extended data collection (tags, similar artists)
 ├── metrics.py             # Pre-computed metrics calculations
 ├── recommender.py         # Recommendation engine
-├── spotify_client.py      # Spotify integration (mocked until API access)
+├── spotify_client.py      # Spotify integration (real API via spotipy)
 ├── run_service.py         # Windows service runner
 ├── static/
 │   ├── css/
@@ -129,8 +131,11 @@ Normalized track data.
 | duration_ms | INTEGER | NULLABLE | Track duration |
 | created_at | DATETIME | NOT NULL | First seen timestamp |
 | -- SPOTIFY PLACEHOLDERS -- | | | |
-| spotify_id | TEXT | NULLABLE | Spotify track ID (future) |
-| spotify_uri | TEXT | NULLABLE | Spotify URI (future) |
+| spotify_id | TEXT | NULLABLE | Spotify track ID |
+| spotify_uri | TEXT | NULLABLE | Spotify URI |
+| spotify_popularity | INTEGER | NULLABLE | Spotify popularity score (0-100) |
+| spotify_popularity_updated_at | DATETIME | NULLABLE | When popularity was last fetched |
+| spotify_preview_url | TEXT | NULLABLE | 30-second audio preview URL |
 | isrc | TEXT | NULLABLE | International Standard Recording Code |
 
 **Index:** `idx_tracks_mbid` on `lastfm_mbid`
@@ -554,7 +559,9 @@ Generate personalized track recommendations.
       "album_name": "Album Name",
       "score": 0.85,
       "reason": "95% tag match with your taste",
-      "spotify_uri": null
+      "spotify_uri": "spotify:track:abc123",
+      "preview_url": "https://p.scdn.co/mp3-preview/...",
+      "recommendation_id": 456
     }
   ],
   "session_id": "uuid-string",
@@ -577,8 +584,33 @@ Record user feedback on a recommendation.
 
 **Response:** `200 OK` with `{"success": true}`
 
+#### `GET /api/recommendations/liked`
+Get liked tracks history.
+
+**Query Parameters:**
+- `limit` (int, default 50): Maximum number of results
+
+**Response:**
+```json
+{
+  "liked_tracks": [
+    {
+      "track_id": 123,
+      "track_name": "Song Name",
+      "artist_name": "Artist Name",
+      "album_name": "Album Name",
+      "album_image_url": "https://...",
+      "preview_url": "https://p.scdn.co/mp3-preview/...",
+      "spotify_uri": "spotify:track:abc123",
+      "liked_at": "2026-03-24T12:00:00Z"
+    }
+  ],
+  "total": 5
+}
+```
+
 #### `GET /api/recommendations/stats`
-Get recommendation statistics.
+Get recommendation statistics. Queries `RecommendationFeedback` table for accurate counts.
 
 **Response:**
 ```json
@@ -591,7 +623,7 @@ Get recommendation statistics.
 }
 ```
 
-### Spotify Integration (Mocked)
+### Spotify Integration
 
 #### `GET /api/spotify/status`
 Get Spotify integration status.
@@ -599,15 +631,15 @@ Get Spotify integration status.
 **Response:**
 ```json
 {
-  "enabled": false,
-  "mock_mode": true,
-  "status": "pending",
-  "message": "Spotify integration pending developer access"
+  "enabled": true,
+  "connected": true,
+  "status": "connected",
+  "message": "Spotify connected"
 }
 ```
 
 #### `POST /api/spotify/create-playlist`
-Create a playlist from recommendations (returns export data while mocked).
+Create a real Spotify playlist from recommendations. Falls back to export if not connected.
 
 **Request Body:**
 ```json
@@ -617,16 +649,14 @@ Create a playlist from recommendations (returns export data while mocked).
 }
 ```
 
-**Response (mocked):**
+**Response (connected):**
 ```json
 {
-  "mock": true,
-  "status": "export_ready",
+  "success": true,
+  "playlist_url": "https://open.spotify.com/playlist/...",
   "playlist_name": "My Discovery Playlist",
-  "tracks": [
-    {"name": "Song", "artist": "Artist", "search_query": "Song Artist"}
-  ],
-  "instructions": ["1. Open Spotify...", "2. Create playlist..."]
+  "tracks_added": 3,
+  "tracks_not_found": 0
 }
 ```
 
@@ -854,53 +884,129 @@ To prevent recommendations dominated by one artist:
 9. Return top 25 ranked recommendations
 ```
 
-## Spotify Integration (Mocked)
+## Spotify Integration
 
-Spotify developer accounts are currently blocked. The `spotify_client.py` module contains mock implementations that:
-- Return export data for manual playlist creation
-- Store track URIs when/if matching is implemented
-- Provide clear "Spotify pending" messaging to users
+Real Spotify API integration using `spotipy`. Provides OAuth playlist creation, track matching, and popularity data.
 
-When Spotify API becomes available:
-1. Set `MOCK_MODE = False` in `spotify_client.py`
-2. Configure OAuth credentials
-3. Implement real API calls (framework is in place)
+### Setup
 
-## Future Spotify Integration Path
-
-### Phase 1: Track Matching
-
-1. For each track in `tracks` table, search Spotify API
-2. Use fuzzy matching on (track_name, artist_name)
-3. Store `spotify_id` and `spotify_uri` in tracks table
-4. Log matching confidence for quality control
-
-### Phase 2: Audio Features Fetch
-
-1. Batch fetch audio features using Spotify's `/audio-features` endpoint
-2. Populate `audio_features` table
-3. Handle rate limiting (max 100 tracks per request)
-
-### Phase 3: OAuth Integration
-
-1. Add Spotify OAuth flow for authenticated features
-2. Enable real-time Spotify listening (in addition to Last.fm)
-3. Access user's Spotify library and playlists
-
-### Required Changes
-
-```python
-# New config fields
-SPOTIFY_CLIENT_ID = "..."
-SPOTIFY_CLIENT_SECRET = "..."
-SPOTIFY_REDIRECT_URI = "http://localhost:5000/callback"
-
-# New endpoints
-POST /api/spotify/connect      # Initiate OAuth
-GET  /api/spotify/callback     # OAuth callback
-POST /api/spotify/match-tracks # Trigger track matching
-POST /api/spotify/fetch-features # Fetch audio features
+1. Create a `.env` file in the project root (gitignored):
 ```
+SPOTIFY_CLIENT_ID=your_client_id
+SPOTIFY_CLIENT_SECRET=your_client_secret
+```
+
+2. Register your app at [developer.spotify.com](https://developer.spotify.com):
+   - Check "Web API" when creating the app
+   - Add `http://127.0.0.1:5000/api/spotify/callback` as a redirect URI
+   - **Important:** Use `127.0.0.1`, not `localhost` — Spotify requires IP-based loopback URIs
+   - Add your Spotify email to User Management (required for Development mode apps)
+
+3. Environment is loaded automatically via `python-dotenv` at app startup.
+
+### How It Works
+
+**Without env vars:** Falls back to mock/export behavior (text file download). No errors.
+
+**With env vars but no user OAuth:** Client credentials mode enables:
+- Track search and matching (background job, every 5 min)
+- Popularity data fetching (background job, every 10 min)
+- These run automatically — no user action needed
+
+**With user OAuth:** Full integration:
+- Direct Spotify playlist creation from recommendations
+- User connects via "Connect Spotify" button on `/discover` page
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│  spotify_client.py                                   │
+│                                                      │
+│  is_spotify_configured()  ← checks env vars          │
+│  _get_client_credentials_sp() ← search/popularity    │
+│  search_track()           ← convenience wrapper      │
+│                                                      │
+│  SpotifyClient(user_id)                              │
+│  ├── search_track()    ← client credentials          │
+│  ├── create_playlist() ← requires user OAuth         │
+│  │   └── uses sp._post('me/playlists', ...) *        │
+│  ├── get_auth_url()    ← OAuth flow start            │
+│  ├── handle_callback() ← OAuth flow complete         │
+│  └── disconnect()      ← clear stored tokens         │
+└─────────────────────────────────────────────────────┘
+* Uses /me/playlists instead of /users/{id}/playlists
+  due to Spotify Development mode restrictions
+```
+
+### OAuth Flow
+
+1. User clicks "Connect Spotify" → `GET /api/spotify/authenticate`
+2. Backend returns Spotify auth URL → frontend redirects user
+3. User authorizes → Spotify redirects to `GET /api/spotify/callback`
+4. Backend exchanges code for tokens → stored in `users` table
+5. User redirected back to `/discover`
+
+Tokens stored: `spotify_access_token`, `spotify_refresh_token`, `spotify_token_expires_at`
+Token refresh is automatic when expired.
+
+### Background Jobs
+
+**`match_tracks_to_spotify_batch`** (every 5 min):
+- Finds tracks without `spotify_id`, prioritized by play count
+- Searches Spotify, stores `spotify_id`, `spotify_uri`, `spotify_popularity`, `spotify_preview_url`
+- Marks unfound tracks with `spotify_id = ''` to skip re-searching
+- Uses client credentials (no user auth needed)
+
+**`refresh_spotify_popularity_batch`** (every 10 min):
+- Refreshes stale popularity scores (>7 days old)
+- Uses Spotify's batch `/tracks` endpoint (50 tracks per call)
+- Updates `spotify_popularity` and `spotify_popularity_updated_at`
+- **Known issue:** `/v1/tracks` endpoint returns 403 in Spotify Development mode; popularity is primarily populated during initial track matching via search
+
+### Popularity Scoring
+
+The recommendation engine (`recommender.py`) uses Spotify's `popularity` field (0-100) for niche/mainstream filtering:
+- **Niche**: popularity < 40
+- **Balanced**: no filter
+- **Mainstream**: popularity > 50
+- Falls back to local scrobble count if no Spotify data
+
+### Spotify API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/spotify/status` | GET | Integration status and auth state |
+| `/api/spotify/authenticate` | GET | Start OAuth flow (returns auth URL) |
+| `/api/spotify/callback` | GET | OAuth callback (stores tokens) |
+| `/api/spotify/disconnect` | POST | Clear Spotify tokens |
+| `/api/spotify/search-track` | POST | Search Spotify for a track |
+| `/api/spotify/create-playlist` | POST | Create playlist (real or export fallback) |
+| `/api/spotify/export` | POST | Export tracks for manual import |
+
+### Audio Preview
+
+Recommendation cards include a 30-second audio preview button when `preview_url` is available from Spotify search results. Preview URLs are stored on the Track model (`spotify_preview_url`) and included in recommendation API responses.
+
+The player uses a single `<audio>` element that toggles between tracks. Only one preview plays at a time.
+
+### Liked Tracks
+
+The Discover page includes a collapsible "Liked Tracks" section showing all tracks the user has liked via recommendation feedback. Data is fetched from `/api/recommendations/liked` (queries `RecommendationFeedback` table joined with Track/Artist). Each entry shows track name, artist, date liked, and a preview button if available.
+
+### Known Spotify Development Mode Limitations
+
+Spotify apps in Development mode have restrictions:
+- `/v1/users/{id}/playlists` returns 403 — use `/v1/me/playlists` instead
+- `/v1/tracks` batch endpoint returns 403 — popularity comes from search results instead
+- Only users added to User Management can authorize the app
+- App must use `127.0.0.1` (not `localhost`) for redirect URIs
+
+### Future Enhancements
+
+- Batch audio features fetch to populate `audio_features` table
+- Real-time Spotify listening (in addition to Last.fm scrobbles)
+- Spotify library/playlist import
 
 ## Scalability Notes (Future Multi-User)
 
@@ -927,6 +1033,12 @@ SYNC_INTERVAL_MINUTES = 30
 LASTFM_API_BASE = "https://ws.audioscrobbler.com/2.0/"
 MAX_SCROBBLES_PER_FETCH = 200
 INITIAL_BACKFILL_PAGES = 50  # ~10,000 scrobbles
+
+# Spotify (set via .env file, loaded by python-dotenv)
+SPOTIFY_CLIENT_ID = None       # Required for Spotify integration
+SPOTIFY_CLIENT_SECRET = None   # Required for Spotify integration
+SPOTIFY_REDIRECT_URI = "http://127.0.0.1:5000/api/spotify/callback"
+SPOTIFY_SCOPE = "playlist-modify-public playlist-modify-private"
 ```
 
 ## Error Handling Strategy
@@ -941,5 +1053,5 @@ INITIAL_BACKFILL_PAGES = 50  # ~10,000 scrobbles
 
 ---
 
-*Last Updated: 2025-02-04*
-*Version: 2.0.0* (Added Recommendation Engine)
+*Last Updated: 2026-03-24*
+*Version: 3.1.0* (Audio Preview, Liked Tracks, Stats Fix, Spotify Dev Mode Fixes)

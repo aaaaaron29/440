@@ -5,17 +5,21 @@ Flask application for Last.fm Listening History Tracker.
 import os
 import csv
 import io
+import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 
-from flask import Flask, request, jsonify, render_template, Response
+from dotenv import load_dotenv
+load_dotenv()
+
+from flask import Flask, request, jsonify, render_template, Response, redirect
 from flask_apscheduler import APScheduler
 from sqlalchemy import func
 
 from config import get_config, Config
 from models import (
-    db, init_db, User, Artist, Album, Track, Scrobble, LovedTrack, SyncLog,
+    db, init_db, migrate_db, User, Artist, Album, Track, Scrobble, LovedTrack, SyncLog,
     ArtistTag, SimilarArtist, Recommendation, RecommendationFeedback,
     ListeningSession, CoListeningPattern, TrackTag
 )
@@ -28,7 +32,7 @@ from recommender import (
 )
 from spotify_client import (
     search_track as spotify_search_track, create_playlist as spotify_create_playlist,
-    get_spotify_status, export_for_spotify
+    get_spotify_status, export_for_spotify, is_spotify_configured, SpotifyClient
 )
 from enhanced_sync_service import (
     EnhancedSyncService, is_enhanced_sync_running, run_enhanced_sync,
@@ -48,6 +52,7 @@ app.config.from_object(get_config())
 
 # Initialize database
 init_db(app)
+migrate_db(app)
 
 # Initialize scheduler
 scheduler = APScheduler()
@@ -657,6 +662,44 @@ def api_recommendation_history():
     })
 
 
+@app.route('/api/recommendations/liked', methods=['GET'])
+@require_configured
+def api_liked_tracks():
+    """Get tracks the user has liked."""
+    user = get_current_user()
+    limit = request.args.get('limit', 50, type=int)
+
+    liked = db.session.query(
+        RecommendationFeedback, Track, Artist
+    ).join(
+        Track, RecommendationFeedback.track_id == Track.id
+    ).join(
+        Artist, Track.artist_id == Artist.id
+    ).filter(
+        RecommendationFeedback.user_id == user.id,
+        RecommendationFeedback.feedback_type == 'like'
+    ).order_by(
+        RecommendationFeedback.timestamp.desc()
+    ).limit(limit).all()
+
+    return jsonify({
+        'liked_tracks': [
+            {
+                'track_id': track.id,
+                'track_name': track.name,
+                'artist_name': artist.name,
+                'album_name': track.album.name if track.album else None,
+                'album_image_url': track.album.image_url if track.album else None,
+                'preview_url': track.spotify_preview_url,
+                'spotify_uri': track.spotify_uri,
+                'liked_at': feedback.timestamp.isoformat() if feedback.timestamp else None
+            }
+            for feedback, track, artist in liked
+        ],
+        'total': len(liked)
+    })
+
+
 # =============================================================================
 # Spotify Integration Endpoints
 # =============================================================================
@@ -664,7 +707,9 @@ def api_recommendation_history():
 @app.route('/api/spotify/status', methods=['GET'])
 def api_spotify_status():
     """Get Spotify integration status."""
-    return jsonify(get_spotify_status())
+    user = get_current_user()
+    user_id = user.id if user else None
+    return jsonify(get_spotify_status(user_id))
 
 
 @app.route('/api/spotify/search-track', methods=['POST'])
@@ -736,6 +781,59 @@ def api_spotify_export():
         return jsonify({'error': 'track_ids is required'}), 400
 
     result = export_for_spotify(track_ids, format=format_type)
+    return jsonify(result)
+
+
+@app.route('/api/spotify/authenticate', methods=['GET'])
+@require_configured
+def api_spotify_authenticate():
+    """Start Spotify OAuth flow. Returns URL to redirect user to."""
+    if not is_spotify_configured():
+        return jsonify({
+            'error': 'Spotify not configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET.'
+        }), 400
+
+    user = get_current_user()
+    client = SpotifyClient(user.id)
+    auth_url = client.get_auth_url()
+
+    return jsonify({'auth_url': auth_url})
+
+
+@app.route('/api/spotify/callback')
+def api_spotify_callback():
+    """Handle Spotify OAuth callback."""
+    code = request.args.get('code')
+    error = request.args.get('error')
+
+    if error:
+        logger.warning(f"Spotify OAuth error: {error}")
+        return redirect('/discover')
+
+    if not code:
+        return jsonify({'error': 'No authorization code received'}), 400
+
+    user = get_current_user()
+    if not user:
+        return jsonify({'error': 'No user configured'}), 400
+
+    client = SpotifyClient(user.id)
+    try:
+        client.handle_callback(code)
+        logger.info("Spotify OAuth completed successfully")
+    except Exception as e:
+        logger.error(f"Spotify OAuth callback failed: {e}")
+
+    return redirect('/discover')
+
+
+@app.route('/api/spotify/disconnect', methods=['POST'])
+@require_configured
+def api_spotify_disconnect():
+    """Disconnect Spotify account."""
+    user = get_current_user()
+    client = SpotifyClient(user.id)
+    result = client.disconnect()
     return jsonify(result)
 
 
@@ -1143,6 +1241,129 @@ def fetch_similar_artists_batch(batch_size: int = 25):
             logger.info(f"Fetched similar artists for {fetched_count} artists")
 
 
+def match_tracks_to_spotify_batch(batch_size: int = 25):
+    """
+    Batch match tracks to Spotify IDs and fetch popularity scores.
+
+    Prioritizes tracks with most plays that don't have Spotify data.
+    Uses client credentials flow (no user auth needed).
+    """
+    with app.app_context():
+        if not is_spotify_configured():
+            logger.debug("Spotify not configured, skipping track matching")
+            return
+
+        # Get tracks without spotify_id, prioritized by play count
+        tracks_needing_match = db.session.query(
+            Track.id,
+            Track.name,
+            Artist.name.label('artist_name'),
+            func.count(Scrobble.id).label('play_count')
+        ).join(Artist, Track.artist_id == Artist.id)\
+         .outerjoin(Scrobble, Scrobble.track_id == Track.id)\
+         .filter(Track.spotify_id.is_(None))\
+         .group_by(Track.id)\
+         .order_by(func.count(Scrobble.id).desc())\
+         .limit(batch_size)\
+         .all()
+
+        if not tracks_needing_match:
+            logger.debug("No tracks need Spotify matching")
+            return
+
+        client = SpotifyClient()
+
+        matched_count = 0
+        for track_row in tracks_needing_match:
+            try:
+                result = client.search_track(track_row.name, track_row.artist_name)
+                track = Track.query.get(track_row.id)
+
+                if result.get('found') and track:
+                    track.spotify_id = result['spotify_id']
+                    track.spotify_uri = result['spotify_uri']
+                    if result.get('popularity') is not None:
+                        track.spotify_popularity = result['popularity']
+                        track.spotify_popularity_updated_at = datetime.utcnow()
+                    if result.get('preview_url'):
+                        track.spotify_preview_url = result['preview_url']
+                    db.session.commit()
+                    matched_count += 1
+                    logger.debug(f"Matched '{track_row.name}' to Spotify: {result['spotify_id']}")
+                elif track and not result.get('found') and not result.get('mock'):
+                    # Mark as checked so we don't re-search
+                    track.spotify_id = ''
+                    db.session.commit()
+            except Exception as e:
+                logger.warning(f"Failed to match '{track_row.name}': {e}")
+                db.session.rollback()
+
+            time.sleep(0.5)
+
+        if matched_count > 0:
+            logger.info(f"Matched {matched_count} tracks to Spotify")
+
+
+def refresh_spotify_popularity_batch(batch_size: int = 50):
+    """
+    Refresh Spotify popularity for tracks that have spotify_id but stale/missing popularity.
+
+    Uses Spotify's batch /tracks endpoint (up to 50 IDs per call).
+    """
+    with app.app_context():
+        if not is_spotify_configured():
+            return
+
+        import spotipy
+        from spotipy.oauth2 import SpotifyClientCredentials
+        from spotipy.cache_handler import MemoryCacheHandler
+        from config import get_config as _get_config
+
+        config = _get_config()
+        stale_threshold = datetime.utcnow() - timedelta(days=7)
+
+        tracks_needing_update = Track.query.filter(
+            Track.spotify_id.isnot(None),
+            Track.spotify_id != '',
+            db.or_(
+                Track.spotify_popularity.is_(None),
+                Track.spotify_popularity_updated_at.is_(None),
+                Track.spotify_popularity_updated_at < stale_threshold
+            )
+        ).order_by(Track.spotify_popularity_updated_at.asc().nullsfirst())\
+         .limit(batch_size)\
+         .all()
+
+        if not tracks_needing_update:
+            return
+
+        sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+            client_id=config.SPOTIFY_CLIENT_ID,
+            client_secret=config.SPOTIFY_CLIENT_SECRET,
+            cache_handler=MemoryCacheHandler()
+        ))
+
+        spotify_ids = [t.spotify_id for t in tracks_needing_update]
+        track_map = {t.spotify_id: t for t in tracks_needing_update}
+
+        try:
+            results = sp.tracks(spotify_ids)
+            updated = 0
+            for sp_track in results['tracks']:
+                if sp_track and sp_track['id'] in track_map:
+                    db_track = track_map[sp_track['id']]
+                    db_track.spotify_popularity = sp_track['popularity']
+                    db_track.spotify_popularity_updated_at = datetime.utcnow()
+                    updated += 1
+
+            db.session.commit()
+            if updated:
+                logger.info(f"Updated Spotify popularity for {updated} tracks")
+        except Exception as e:
+            logger.warning(f"Failed to refresh Spotify popularity: {e}")
+            db.session.rollback()
+
+
 def update_sync_schedule(user: User):
     """Update the sync schedule based on user settings."""
     job_id = 'sync_job'
@@ -1204,6 +1425,26 @@ def init_scheduler():
         replace_existing=True
     )
     logger.info("Similar artists fetcher scheduled every 5 minutes")
+
+    # Add Spotify track matching job (runs every 5 minutes)
+    scheduler.add_job(
+        id='spotify_match_job',
+        func=match_tracks_to_spotify_batch,
+        trigger='interval',
+        minutes=5,
+        replace_existing=True
+    )
+    logger.info("Spotify track matching scheduled every 5 minutes")
+
+    # Add Spotify popularity refresh job (runs every 10 minutes)
+    scheduler.add_job(
+        id='spotify_popularity_job',
+        func=refresh_spotify_popularity_batch,
+        trigger='interval',
+        minutes=10,
+        replace_existing=True
+    )
+    logger.info("Spotify popularity refresh scheduled every 10 minutes")
 
 
 # =============================================================================

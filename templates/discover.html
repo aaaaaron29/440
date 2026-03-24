@@ -410,6 +410,99 @@
             border-color: var(--color-error);
         }
 
+        .feedback-btn.preview-btn {
+            font-size: 0.75rem;
+        }
+
+        .feedback-btn.preview-btn.playing {
+            background: var(--color-primary);
+            border-color: var(--color-primary);
+        }
+
+        /* Liked Tracks Section */
+        .liked-section {
+            background: var(--color-surface);
+            border-radius: var(--border-radius);
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .liked-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            cursor: pointer;
+            margin-bottom: 0;
+        }
+
+        .liked-header h3 {
+            margin: 0;
+        }
+
+        .liked-header .toggle-icon {
+            font-size: 1.2rem;
+            transition: transform 0.2s;
+        }
+
+        .liked-section.expanded .toggle-icon {
+            transform: rotate(180deg);
+        }
+
+        .liked-list {
+            display: none;
+            margin-top: 1rem;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .liked-section.expanded .liked-list {
+            display: block;
+        }
+
+        .liked-item {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.5rem 0;
+            border-bottom: 1px solid var(--color-border);
+        }
+
+        .liked-item:last-child {
+            border-bottom: none;
+        }
+
+        .liked-item img {
+            width: 40px;
+            height: 40px;
+            border-radius: 4px;
+            object-fit: cover;
+            background: var(--color-border);
+        }
+
+        .liked-item-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .liked-item-info .track-name {
+            font-weight: 500;
+            font-size: 0.875rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .liked-item-info .artist-name {
+            font-size: 0.75rem;
+            color: var(--color-text-secondary);
+        }
+
+        .liked-item .liked-date {
+            font-size: 0.7rem;
+            color: var(--color-text-muted);
+            white-space: nowrap;
+        }
+
         /* Spotify Notice */
         .spotify-notice {
             background: var(--color-surface);
@@ -564,6 +657,31 @@
                 </div>
             </div>
 
+            <!-- Spotify Connection Section -->
+            <div class="spotify-notice" id="spotify-status-section">
+                <div class="notice-icon">&#127925;</div>
+                <div class="notice-text" id="spotify-notice-text">
+                    <h4>Loading Spotify status...</h4>
+                </div>
+                <button class="btn btn-primary" id="btn-connect-spotify" style="display:none;">
+                    Connect Spotify
+                </button>
+                <button class="btn btn-secondary" id="btn-disconnect-spotify" style="display:none;">
+                    Disconnect
+                </button>
+            </div>
+
+            <!-- Liked Tracks Section -->
+            <div class="liked-section" id="liked-section">
+                <div class="liked-header" onclick="toggleLikedSection()">
+                    <h3>Liked Tracks (<span id="liked-count">0</span>)</h3>
+                    <span class="toggle-icon">&#9660;</span>
+                </div>
+                <div class="liked-list" id="liked-list">
+                    <p style="color: var(--color-text-muted);">No liked tracks yet.</p>
+                </div>
+            </div>
+
             <!-- Wizard Steps Indicator -->
             <div class="wizard-steps">
                 <div class="wizard-step active" data-step="1">
@@ -683,15 +801,6 @@
                     <!-- Recommendations will be inserted here -->
                 </div>
 
-                <!-- Spotify Notice -->
-                <div class="spotify-notice">
-                    <div class="notice-icon">&#127925;</div>
-                    <div class="notice-text">
-                        <h4>Spotify Integration Pending</h4>
-                        <p>Direct playlist creation is coming soon. For now, export your recommendations and create the playlist manually on Spotify.</p>
-                    </div>
-                </div>
-
                 <div class="wizard-nav">
                     <button class="btn btn-secondary" id="btn-start-over">Start Over</button>
                     <button class="btn btn-primary" id="btn-add-liked">Add Liked to Playlist</button>
@@ -706,6 +815,7 @@
         </div>
     </div>
 
+    <audio id="preview-player" preload="none"></audio>
     <script src="/static/js/discover.js"></script>
 </body>
 </html>

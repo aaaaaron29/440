@@ -12,7 +12,9 @@ const state = {
     popularity: 'balanced',
     recommendations: [],
     sessionId: null,
-    likedTracks: new Set()
+    likedTracks: new Set(),
+    spotifyAuthenticated: false,
+    currentPreviewUrl: null
 };
 
 // DOM Elements
@@ -36,6 +38,8 @@ document.addEventListener('DOMContentLoaded', () => {
     initializeEventListeners();
     loadStats();
     loadTopArtists();
+    checkSpotifyStatus();
+    loadLikedTracks();
 });
 
 function initializeEventListeners() {
@@ -227,7 +231,7 @@ function renderRecommendations() {
     }
 
     elements.recommendationGrid.innerHTML = state.recommendations.map((rec, index) => `
-        <div class="recommendation-card" data-track-id="${rec.track_id}" data-index="${index}">
+        <div class="recommendation-card" data-track-id="${rec.track_id}" data-rec-id="${rec.recommendation_id || ''}" data-index="${index}">
             <img src="${rec.album_image_url || '/static/img/default-album.png'}"
                  alt="${rec.album_name || 'Album'}"
                  onerror="this.src='/static/img/default-album.png'">
@@ -236,12 +240,13 @@ function renderRecommendations() {
                 <div class="artist-name">${rec.artist_name}</div>
                 <div class="reason">${rec.reason}</div>
             </div>
+            ${rec.preview_url ? `<button class="feedback-btn preview-btn" onclick="togglePreview('${rec.preview_url}', this)" title="Preview">&#9654;</button>` : ''}
             <span class="score-badge">${Math.round(rec.score * 100)}%</span>
             <div class="feedback-buttons">
-                <button class="feedback-btn like-btn" onclick="recordFeedback(${rec.track_id}, 'like', this)" title="Like">
+                <button class="feedback-btn like-btn" onclick="recordFeedback(${rec.track_id}, 'like', this, ${rec.recommendation_id || 'null'})" title="Like">
                     &#128077;
                 </button>
-                <button class="feedback-btn dislike-btn" onclick="recordFeedback(${rec.track_id}, 'dislike', this)" title="Dislike">
+                <button class="feedback-btn dislike-btn" onclick="recordFeedback(${rec.track_id}, 'dislike', this, ${rec.recommendation_id || 'null'})" title="Dislike">
                     &#128078;
                 </button>
             </div>
@@ -250,15 +255,20 @@ function renderRecommendations() {
 }
 
 // Record feedback
-async function recordFeedback(trackId, feedbackType, button) {
+async function recordFeedback(trackId, feedbackType, button, recommendationId) {
     try {
+        const body = {
+            track_id: trackId,
+            feedback_type: feedbackType
+        };
+        if (recommendationId) {
+            body.recommendation_id = recommendationId;
+        }
+
         const response = await fetch('/api/recommendations/feedback', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                track_id: trackId,
-                feedback_type: feedbackType
-            })
+            body: JSON.stringify(body)
         });
 
         const data = await response.json();
@@ -280,8 +290,9 @@ async function recordFeedback(trackId, feedbackType, button) {
                 state.likedTracks.delete(trackId);
             }
 
-            // Update stats
+            // Update stats and liked tracks
             loadStats();
+            loadLikedTracks();
         }
     } catch (error) {
         console.error('Failed to record feedback:', error);
@@ -319,6 +330,7 @@ async function createPlaylist() {
     const trackIds = state.recommendations.map(r => r.track_id);
 
     try {
+        showLoading(true);
         const response = await fetch('/api/spotify/create-playlist', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -330,15 +342,24 @@ async function createPlaylist() {
 
         const data = await response.json();
 
-        if (data.mock) {
-            // Show export data in a modal or download
-            showPlaylistExport(data);
-        } else if (data.playlist_url) {
+        if (data.playlist_url) {
+            // Real Spotify playlist created
             window.open(data.playlist_url, '_blank');
+            let msg = `Playlist created with ${data.tracks_added} tracks!`;
+            if (data.tracks_unmatched > 0) {
+                msg += ` (${data.tracks_unmatched} tracks couldn't be found on Spotify)`;
+            }
+            alert(msg);
+        } else if (data.mock) {
+            showPlaylistExport(data);
+        } else if (data.error) {
+            alert(data.error);
         }
     } catch (error) {
         console.error('Failed to create playlist:', error);
         alert('Failed to create playlist');
+    } finally {
+        showLoading(false);
     }
 }
 
@@ -369,6 +390,7 @@ async function addLikedToPlaylist() {
     const trackIds = Array.from(state.likedTracks);
 
     try {
+        showLoading(true);
         const response = await fetch('/api/spotify/create-playlist', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -379,10 +401,24 @@ async function addLikedToPlaylist() {
         });
 
         const data = await response.json();
-        showPlaylistExport(data);
+
+        if (data.playlist_url) {
+            window.open(data.playlist_url, '_blank');
+            let msg = `Playlist created with ${data.tracks_added} tracks!`;
+            if (data.tracks_unmatched > 0) {
+                msg += ` (${data.tracks_unmatched} tracks couldn't be found on Spotify)`;
+            }
+            alert(msg);
+        } else if (data.mock) {
+            showPlaylistExport(data);
+        } else if (data.error) {
+            alert(data.error);
+        }
     } catch (error) {
         console.error('Failed to create playlist:', error);
         alert('Failed to create playlist');
+    } finally {
+        showLoading(false);
     }
 }
 
@@ -423,5 +459,132 @@ function showLoading(show) {
     elements.loadingOverlay.classList.toggle('active', show);
 }
 
-// Make recordFeedback available globally
+// Spotify integration
+async function checkSpotifyStatus() {
+    try {
+        const response = await fetch('/api/spotify/status');
+        const data = await response.json();
+
+        state.spotifyAuthenticated = data.authenticated;
+
+        const noticeText = document.getElementById('spotify-notice-text');
+        const connectBtn = document.getElementById('btn-connect-spotify');
+        const disconnectBtn = document.getElementById('btn-disconnect-spotify');
+
+        if (data.authenticated) {
+            noticeText.innerHTML = '<h4>Spotify Connected</h4><p>Playlists will be created directly in your Spotify account.</p>';
+            connectBtn.style.display = 'none';
+            disconnectBtn.style.display = 'inline-block';
+            disconnectBtn.onclick = disconnectSpotify;
+        } else if (data.enabled) {
+            noticeText.innerHTML = '<h4>Connect Your Spotify Account</h4><p>Connect to create playlists directly in Spotify.</p>';
+            connectBtn.style.display = 'inline-block';
+            connectBtn.onclick = connectSpotify;
+            disconnectBtn.style.display = 'none';
+        } else {
+            noticeText.innerHTML = '<h4>Spotify Not Configured</h4><p>Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to enable Spotify integration.</p>';
+            connectBtn.style.display = 'none';
+            disconnectBtn.style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Failed to check Spotify status:', error);
+    }
+}
+
+async function connectSpotify() {
+    try {
+        const response = await fetch('/api/spotify/authenticate');
+        const data = await response.json();
+
+        if (data.auth_url) {
+            window.location.href = data.auth_url;
+        } else if (data.error) {
+            alert(data.error);
+        }
+    } catch (error) {
+        console.error('Failed to start Spotify auth:', error);
+    }
+}
+
+async function disconnectSpotify() {
+    try {
+        const response = await fetch('/api/spotify/disconnect', { method: 'POST' });
+        const data = await response.json();
+        if (data.status === 'disconnected') {
+            checkSpotifyStatus();
+        }
+    } catch (error) {
+        console.error('Failed to disconnect Spotify:', error);
+    }
+}
+
+// Audio preview
+function togglePreview(url, button) {
+    const player = document.getElementById('preview-player');
+
+    // Reset all preview buttons
+    document.querySelectorAll('.preview-btn.playing').forEach(btn => {
+        if (btn !== button) btn.classList.remove('playing');
+    });
+
+    if (state.currentPreviewUrl === url && !player.paused) {
+        // Same track, pause it
+        player.pause();
+        button.classList.remove('playing');
+        state.currentPreviewUrl = null;
+    } else {
+        // New track or resume
+        player.src = url;
+        player.play();
+        button.classList.add('playing');
+        state.currentPreviewUrl = url;
+
+        player.onended = () => {
+            button.classList.remove('playing');
+            state.currentPreviewUrl = null;
+        };
+    }
+}
+
+// Liked tracks section
+async function loadLikedTracks() {
+    try {
+        const response = await fetch('/api/recommendations/liked?limit=50');
+        const data = await response.json();
+
+        const countEl = document.getElementById('liked-count');
+        const listEl = document.getElementById('liked-list');
+
+        countEl.textContent = data.total || 0;
+
+        if (!data.liked_tracks || data.liked_tracks.length === 0) {
+            listEl.innerHTML = '<p style="color: var(--color-text-muted); font-size: 0.875rem;">No liked tracks yet. Like some recommendations to see them here.</p>';
+            return;
+        }
+
+        listEl.innerHTML = data.liked_tracks.map(track => `
+            <div class="liked-item">
+                <img src="${track.album_image_url || '/static/img/default-album.png'}"
+                     alt="${track.album_name || 'Album'}"
+                     onerror="this.src='/static/img/default-album.png'">
+                <div class="liked-item-info">
+                    <div class="track-name">${track.track_name}</div>
+                    <div class="artist-name">${track.artist_name}</div>
+                </div>
+                ${track.preview_url ? `<button class="feedback-btn preview-btn" onclick="togglePreview('${track.preview_url}', this)" title="Preview">&#9654;</button>` : ''}
+                <span class="liked-date">${track.liked_at ? new Date(track.liked_at).toLocaleDateString() : ''}</span>
+            </div>
+        `).join('');
+    } catch (error) {
+        console.error('Failed to load liked tracks:', error);
+    }
+}
+
+function toggleLikedSection() {
+    document.getElementById('liked-section').classList.toggle('expanded');
+}
+
+// Make functions available globally
 window.recordFeedback = recordFeedback;
+window.togglePreview = togglePreview;
+window.toggleLikedSection = toggleLikedSection;

@@ -658,19 +658,25 @@ class RecommendationEngine:
                 self._scrobble_count_cache[tid] = 0
 
     def _calculate_popularity_score(self, track: Track, inverse: bool = False) -> float:
-        """Calculate popularity score based on total scrobbles."""
-        # Use cache if available (batch prefetched), otherwise query
-        if track.id in self._scrobble_count_cache:
-            scrobble_count = self._scrobble_count_cache[track.id]
-        else:
-            scrobble_count = Scrobble.query.filter_by(track_id=track.id).count()
-            self._scrobble_count_cache[track.id] = scrobble_count
+        """Calculate popularity score.
 
-        # Logarithmic scale
-        if scrobble_count == 0:
-            score = 0.1
+        Uses Spotify popularity (0-100) if available, falls back to local scrobble count.
+        """
+        if track.spotify_popularity is not None:
+            # Normalize Spotify's 0-100 to 0.0-1.0
+            score = track.spotify_popularity / 100.0
         else:
-            score = min(1, math.log(scrobble_count + 1) / 10)
+            # Fallback: use local scrobble count (original behavior)
+            if track.id in self._scrobble_count_cache:
+                scrobble_count = self._scrobble_count_cache[track.id]
+            else:
+                scrobble_count = Scrobble.query.filter_by(track_id=track.id).count()
+                self._scrobble_count_cache[track.id] = scrobble_count
+
+            if scrobble_count == 0:
+                score = 0.1
+            else:
+                score = min(1, math.log(scrobble_count + 1) / 10)
 
         return 1 - score if inverse else score
 
@@ -679,15 +685,34 @@ class RecommendationEngine:
         candidates: List[Dict],
         popularity_level: str
     ) -> List[Dict]:
-        """Filter candidates based on popularity preference."""
-        if popularity_level == 'mainstream':
-            # Keep only higher popularity tracks
-            return [c for c in candidates if c.get('popularity_score', 0.5) > 0.4]
-        elif popularity_level == 'niche':
-            # Keep only lower popularity tracks
-            return [c for c in candidates if c.get('popularity_score', 0.5) < 0.6]
-        else:  # balanced
+        """Filter candidates based on popularity preference using Spotify popularity.
+
+        Thresholds based on Spotify's 0-100 scale (normalized to 0-1):
+        - Mainstream: popularity > 50 (score > 0.5)
+        - Niche: popularity < 40 (score < 0.4)
+        - Balanced: no filter
+        """
+        if popularity_level == 'balanced':
             return candidates
+
+        filtered = []
+        for c in candidates:
+            pop_score = c.get('popularity_score', 0.5)
+
+            if popularity_level == 'mainstream' and pop_score > 0.5:
+                filtered.append(c)
+            elif popularity_level == 'niche' and pop_score < 0.4:
+                filtered.append(c)
+
+        # Safety: if filter removed everything, return unfiltered
+        if not filtered and candidates:
+            logger.warning(
+                f"Popularity filter '{popularity_level}' removed all {len(candidates)} "
+                f"candidates, returning unfiltered"
+            )
+            return candidates
+
+        return filtered
 
     def _load_feedback_weights(self) -> Dict:
         """Load user's feedback history to weight recommendations."""
@@ -744,7 +769,8 @@ class RecommendationEngine:
             'reason': reason,
             'spotify_uri': track.spotify_uri,
             'lastfm_url': track.url,
-            'popularity_score': self._calculate_popularity_score(track)
+            'popularity_score': self._calculate_popularity_score(track),
+            'preview_url': track.spotify_preview_url
         }
 
     def _store_recommendations(
@@ -755,6 +781,7 @@ class RecommendationEngine:
         popularity_level: str
     ):
         """Store generated recommendations in database."""
+        db_recs = []
         for rec in recommendations:
             recommendation = Recommendation(
                 user_id=self.user_id,
@@ -767,9 +794,13 @@ class RecommendationEngine:
                 generated_at=datetime.utcnow()
             )
             db.session.add(recommendation)
+            db_recs.append((recommendation, rec))
 
         try:
             db.session.commit()
+            # Set recommendation_id on each dict so frontend can send it with feedback
+            for db_rec, rec_dict in db_recs:
+                rec_dict['recommendation_id'] = db_rec.id
         except Exception as e:
             logger.error(f"Failed to store recommendations: {e}")
             db.session.rollback()
@@ -852,16 +883,17 @@ def get_recommendation_stats(user_id: int) -> Dict:
     """Get recommendation statistics for a user."""
     total = Recommendation.query.filter_by(user_id=user_id).count()
 
-    likes = Recommendation.query.filter_by(
-        user_id=user_id, feedback='like'
+    # Query RecommendationFeedback (where feedback is actually stored)
+    likes = RecommendationFeedback.query.filter_by(
+        user_id=user_id, feedback_type='like'
     ).count()
 
-    dislikes = Recommendation.query.filter_by(
-        user_id=user_id, feedback='dislike'
+    dislikes = RecommendationFeedback.query.filter_by(
+        user_id=user_id, feedback_type='dislike'
     ).count()
 
-    skips = Recommendation.query.filter_by(
-        user_id=user_id, feedback='skip'
+    skips = RecommendationFeedback.query.filter_by(
+        user_id=user_id, feedback_type='skip'
     ).count()
 
     # Calculate rates
@@ -869,12 +901,21 @@ def get_recommendation_stats(user_id: int) -> Dict:
     like_rate = (likes / presented * 100) if presented > 0 else 0
     dislike_rate = (dislikes / presented * 100) if presented > 0 else 0
 
-    # Find best performing mode
-    comfort_likes = Recommendation.query.filter_by(
-        user_id=user_id, mode='comfort_zone', feedback='like'
+    # Find best performing mode (join feedback with recommendation to get mode)
+    comfort_likes = db.session.query(RecommendationFeedback).join(
+        Recommendation, RecommendationFeedback.recommendation_id == Recommendation.id
+    ).filter(
+        RecommendationFeedback.user_id == user_id,
+        RecommendationFeedback.feedback_type == 'like',
+        Recommendation.mode == 'comfort_zone'
     ).count()
-    branch_likes = Recommendation.query.filter_by(
-        user_id=user_id, mode='branch_out', feedback='like'
+
+    branch_likes = db.session.query(RecommendationFeedback).join(
+        Recommendation, RecommendationFeedback.recommendation_id == Recommendation.id
+    ).filter(
+        RecommendationFeedback.user_id == user_id,
+        RecommendationFeedback.feedback_type == 'like',
+        Recommendation.mode == 'branch_out'
     ).count()
 
     best_mode = 'comfort_zone' if comfort_likes >= branch_likes else 'branch_out'

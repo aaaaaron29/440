@@ -1,147 +1,199 @@
 """
 Spotify Integration Client for Last.fm Listening History Tracker.
 
-NOTE: Spotify developer accounts are currently blocked. This module contains
-mock implementations that simulate the expected behavior. When Spotify API
-access becomes available, replace mock functions with real implementations.
+Provides OAuth authentication, track search, playlist creation, and
+popularity data fetching via the Spotify Web API using spotipy.
 
-See claude.md for integration documentation.
+When SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are set in the environment,
+real Spotify API calls are used. Otherwise, falls back to mock/export behavior.
 """
 
-import json
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from datetime import datetime
 
-from models import db, Track, User
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth, SpotifyClientCredentials
+from spotipy.cache_handler import MemoryCacheHandler
+
+from models import db, Track, Artist, User
 
 logger = logging.getLogger(__name__)
 
-# Configuration - TODO: Move to config.py when Spotify API available
-SPOTIFY_CLIENT_ID = None  # TODO: Activate when Spotify API available
-SPOTIFY_CLIENT_SECRET = None  # TODO: Activate when Spotify API available
-SPOTIFY_REDIRECT_URI = "http://localhost:5000/api/spotify/callback"
 
-# Mock mode flag - set to False when real Spotify integration is ready
-MOCK_MODE = True
+def _get_spotify_config() -> Dict:
+    """Get Spotify config from Flask app config."""
+    from config import get_config
+    config = get_config()
+    return {
+        'client_id': getattr(config, 'SPOTIFY_CLIENT_ID', None),
+        'client_secret': getattr(config, 'SPOTIFY_CLIENT_SECRET', None),
+        'redirect_uri': getattr(config, 'SPOTIFY_REDIRECT_URI', 'http://127.0.0.1:5000/api/spotify/callback'),
+        'scope': getattr(config, 'SPOTIFY_SCOPE', 'playlist-modify-public playlist-modify-private'),
+    }
+
+
+def is_spotify_configured() -> bool:
+    """Check if Spotify API credentials are set."""
+    cfg = _get_spotify_config()
+    return bool(cfg['client_id'] and cfg['client_secret'])
+
+
+def _get_client_credentials_sp() -> Optional[spotipy.Spotify]:
+    """Get a spotipy client using client credentials flow (no user auth needed).
+
+    Used for search and popularity fetching — does not require user login.
+    """
+    if not is_spotify_configured():
+        return None
+
+    cfg = _get_spotify_config()
+    auth_manager = SpotifyClientCredentials(
+        client_id=cfg['client_id'],
+        client_secret=cfg['client_secret'],
+        cache_handler=MemoryCacheHandler()
+    )
+    return spotipy.Spotify(auth_manager=auth_manager)
 
 
 class SpotifyClient:
     """
     Spotify API client for track matching and playlist creation.
 
-    Currently operates in mock mode. When Spotify API becomes available:
-    1. Set MOCK_MODE = False
-    2. Configure SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET
-    3. Implement OAuth flow in authenticate_spotify()
+    - Track search and popularity: uses client credentials (no user login)
+    - Playlist creation: requires user OAuth authentication
     """
 
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int = None):
         self.user_id = user_id
-        self.user = User.query.get(user_id)
-        self.access_token = None
-        self.refresh_token = None
+        self.user = User.query.get(user_id) if user_id else None
 
     def is_authenticated(self) -> bool:
         """Check if user has valid Spotify authentication."""
-        if MOCK_MODE:
+        if not self.user or not self.user.spotify_access_token:
             return False
-        # TODO: Activate when Spotify API available
-        # Check if user has stored tokens and they're not expired
-        return self.access_token is not None
+        return True
 
-    def authenticate_spotify(self) -> Dict:
-        """
-        Initiate Spotify OAuth flow.
-
-        TODO: Activate when Spotify API available
-        Returns auth URL for user to visit, or error if already authenticated.
-        """
-        if MOCK_MODE:
-            return {
-                'status': 'mock_mode',
-                'message': 'Spotify integration pending. Developer access required.',
-                'mock': True,
-                'instructions': 'Export recommendations to JSON and create playlist manually on Spotify.'
-            }
-
-        # TODO: Implement real OAuth flow
-        # auth_url = f"https://accounts.spotify.com/authorize?client_id={SPOTIFY_CLIENT_ID}&..."
-        # return {'status': 'redirect', 'auth_url': auth_url}
-        pass
+    def get_auth_url(self) -> str:
+        """Get Spotify authorization URL for OAuth flow."""
+        cfg = _get_spotify_config()
+        sp_oauth = SpotifyOAuth(
+            client_id=cfg['client_id'],
+            client_secret=cfg['client_secret'],
+            redirect_uri=cfg['redirect_uri'],
+            scope=cfg['scope'],
+            cache_handler=MemoryCacheHandler(),
+            show_dialog=True
+        )
+        return sp_oauth.get_authorize_url()
 
     def handle_callback(self, code: str) -> Dict:
-        """
-        Handle OAuth callback and exchange code for tokens.
+        """Exchange OAuth authorization code for access/refresh tokens."""
+        cfg = _get_spotify_config()
+        sp_oauth = SpotifyOAuth(
+            client_id=cfg['client_id'],
+            client_secret=cfg['client_secret'],
+            redirect_uri=cfg['redirect_uri'],
+            scope=cfg['scope'],
+            cache_handler=MemoryCacheHandler()
+        )
+        token_info = sp_oauth.get_access_token(code)
+        logger.info(f"Spotify token scopes: {token_info.get('scope', 'NONE')}")
 
-        TODO: Activate when Spotify API available
-        """
-        if MOCK_MODE:
-            return {'status': 'mock_mode', 'mock': True}
+        self.user.spotify_access_token = token_info['access_token']
+        self.user.spotify_refresh_token = token_info['refresh_token']
+        self.user.spotify_token_expires_at = (
+            datetime.utcnow() + timedelta(seconds=token_info['expires_in'] - 60)
+        )
+        db.session.commit()
 
-        # TODO: Exchange code for access_token and refresh_token
-        # Store tokens for user
-        pass
+        return {'status': 'connected', 'mock': False}
+
+    def disconnect(self) -> Dict:
+        """Clear stored Spotify tokens."""
+        if self.user:
+            self.user.spotify_access_token = None
+            self.user.spotify_refresh_token = None
+            self.user.spotify_token_expires_at = None
+            db.session.commit()
+        return {'status': 'disconnected'}
+
+    def _get_authenticated_sp(self) -> Optional[spotipy.Spotify]:
+        """Get a user-authenticated spotipy client, refreshing token if needed."""
+        if not self.is_authenticated():
+            return None
+
+        # Refresh if expired
+        if (self.user.spotify_token_expires_at and
+                self.user.spotify_token_expires_at <= datetime.utcnow()):
+            if not self._refresh_token():
+                return None
+
+        return spotipy.Spotify(auth=self.user.spotify_access_token)
+
+    def _refresh_token(self) -> bool:
+        """Refresh the Spotify access token using the refresh token."""
+        if not self.user or not self.user.spotify_refresh_token:
+            return False
+
+        try:
+            cfg = _get_spotify_config()
+            sp_oauth = SpotifyOAuth(
+                client_id=cfg['client_id'],
+                client_secret=cfg['client_secret'],
+                redirect_uri=cfg['redirect_uri'],
+                scope=cfg['scope'],
+                cache_handler=MemoryCacheHandler()
+            )
+            token_info = sp_oauth.refresh_access_token(self.user.spotify_refresh_token)
+
+            self.user.spotify_access_token = token_info['access_token']
+            if 'refresh_token' in token_info:
+                self.user.spotify_refresh_token = token_info['refresh_token']
+            self.user.spotify_token_expires_at = (
+                datetime.utcnow() + timedelta(seconds=token_info['expires_in'] - 60)
+            )
+            db.session.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to refresh Spotify token: {e}")
+            return False
 
     def search_track(self, track_name: str, artist_name: str) -> Dict:
-        """
-        Search Spotify for a track by name and artist.
-
-        Args:
-            track_name: Name of the track
-            artist_name: Name of the artist
-
-        Returns:
-            Dict with spotify_id, spotify_uri, preview_url, or mock response
-        """
-        if MOCK_MODE:
-            # Return mock response that indicates Spotify matching is pending
+        """Search Spotify for a track. Uses client credentials (no user auth)."""
+        sp = _get_client_credentials_sp()
+        if not sp:
             return {
                 'found': False,
                 'mock': True,
-                'message': 'Spotify search unavailable - integration pending',
+                'message': 'Spotify not configured',
                 'track_name': track_name,
                 'artist_name': artist_name,
                 'suggestion': f'Search manually: "{track_name}" by {artist_name}'
             }
 
-        # TODO: Activate when Spotify API available
-        # response = requests.get(
-        #     "https://api.spotify.com/v1/search",
-        #     headers={"Authorization": f"Bearer {self.access_token}"},
-        #     params={
-        #         "q": f"track:{track_name} artist:{artist_name}",
-        #         "type": "track",
-        #         "limit": 1
-        #     }
-        # )
-        # if response.ok and response.json()['tracks']['items']:
-        #     track = response.json()['tracks']['items'][0]
-        #     return {
-        #         'found': True,
-        #         'spotify_id': track['id'],
-        #         'spotify_uri': track['uri'],
-        #         'preview_url': track.get('preview_url'),
-        #         'album_image': track['album']['images'][0]['url'] if track['album']['images'] else None
-        #     }
-        pass
+        try:
+            query = f"track:{track_name} artist:{artist_name}"
+            results = sp.search(q=query, type='track', limit=1)
 
-    def get_playback_url(self, spotify_id: str) -> Dict:
-        """
-        Get Spotify playback URL/URI for a track.
+            if results['tracks']['items']:
+                item = results['tracks']['items'][0]
+                album_images = item.get('album', {}).get('images', [])
+                return {
+                    'found': True,
+                    'mock': False,
+                    'spotify_id': item['id'],
+                    'spotify_uri': item['uri'],
+                    'popularity': item.get('popularity'),
+                    'preview_url': item.get('preview_url'),
+                    'album_image': album_images[0]['url'] if album_images else None
+                }
 
-        TODO: Activate when Spotify API available
-        """
-        if MOCK_MODE:
-            return {
-                'mock': True,
-                'spotify_uri': f'spotify:track:{spotify_id}' if spotify_id else None,
-                'web_url': f'https://open.spotify.com/track/{spotify_id}' if spotify_id else None,
-                'message': 'Direct playback unavailable - use Spotify app'
-            }
+            return {'found': False, 'mock': False, 'message': 'Track not found on Spotify'}
 
-        # TODO: Return actual playback controls
-        pass
+        except Exception as e:
+            logger.warning(f"Spotify search failed for '{track_name}' by '{artist_name}': {e}")
+            return {'found': False, 'mock': False, 'message': str(e)}
 
     def create_playlist(
         self,
@@ -149,120 +201,114 @@ class SpotifyClient:
         playlist_name: str,
         description: str = None
     ) -> Dict:
-        """
-        Create a Spotify playlist from track IDs.
+        """Create a Spotify playlist from internal track IDs.
 
-        Args:
-            track_ids: List of our internal track IDs
-            playlist_name: Name for the new playlist
-            description: Optional playlist description
-
-        Returns:
-            Dict with playlist_url or mock response with export data
+        Requires user OAuth. Falls back to export if not authenticated.
         """
-        # Get tracks from our database
+        sp = self._get_authenticated_sp()
+        if not sp:
+            return self._mock_create_playlist(track_ids, playlist_name)
+
         tracks = Track.query.filter(Track.id.in_(track_ids)).all()
 
-        if MOCK_MODE:
-            # Return exportable data for manual playlist creation
-            track_list = []
-            for track in tracks:
-                track_list.append({
-                    'track_id': track.id,
-                    'name': track.name,
-                    'artist': track.artist.name if track.artist else 'Unknown',
-                    'spotify_uri': track.spotify_uri,
-                    'search_query': f"{track.name} {track.artist.name if track.artist else ''}"
-                })
+        # Collect Spotify URIs, searching on-the-fly for unmatched tracks
+        uris = []
+        unmatched = []
+        for track in tracks:
+            if track.spotify_uri:
+                uris.append(track.spotify_uri)
+            else:
+                artist_name = track.artist.name if track.artist else ''
+                result = self.search_track(track.name, artist_name)
+                if result.get('found'):
+                    track.spotify_uri = result['spotify_uri']
+                    track.spotify_id = result['spotify_id']
+                    if result.get('popularity') is not None:
+                        track.spotify_popularity = result['popularity']
+                        track.spotify_popularity_updated_at = datetime.utcnow()
+                    if result.get('preview_url'):
+                        track.spotify_preview_url = result['preview_url']
+                    uris.append(result['spotify_uri'])
+                else:
+                    unmatched.append({
+                        'name': track.name,
+                        'artist': artist_name
+                    })
 
+        db.session.commit()
+
+        if not uris:
             return {
-                'mock': True,
-                'status': 'export_ready',
-                'message': 'Spotify playlist creation unavailable. Use exported data to create manually.',
-                'playlist_name': playlist_name,
-                'track_count': len(track_list),
-                'tracks': track_list,
-                'export_format': 'Copy track names to search in Spotify',
-                'instructions': [
-                    '1. Open Spotify and create a new playlist',
-                    f'2. Name it: {playlist_name}',
-                    '3. Search for each track below and add to playlist',
-                    '4. Or use Spotify\'s "Add songs" feature with track names'
-                ]
+                'error': 'No tracks could be matched to Spotify',
+                'unmatched': unmatched
             }
 
-        # TODO: Activate when Spotify API available
-        # 1. Create playlist via API
-        # 2. Match our track_ids to Spotify URIs
-        # 3. Add tracks to playlist
-        # 4. Return playlist URL
-        pass
+        try:
+            playlist = sp._post(
+                'me/playlists',
+                payload={
+                    'name': playlist_name,
+                    'public': True,
+                    'description': description or f"Generated by Last.fm Tracker on {datetime.utcnow().strftime('%Y-%m-%d')}"
+                }
+            )
 
-    def add_to_playlist(self, playlist_id: str, track_ids: List[int]) -> Dict:
-        """
-        Add tracks to an existing Spotify playlist.
+            # Add tracks in batches of 100 (Spotify API limit)
+            for i in range(0, len(uris), 100):
+                sp.playlist_add_items(playlist['id'], uris[i:i + 100])
 
-        TODO: Activate when Spotify API available
-        """
-        if MOCK_MODE:
             return {
-                'mock': True,
-                'message': 'Cannot add to Spotify playlist - integration pending',
-                'track_count': len(track_ids)
+                'mock': False,
+                'status': 'created',
+                'playlist_url': playlist['external_urls']['spotify'],
+                'playlist_id': playlist['id'],
+                'tracks_added': len(uris),
+                'tracks_unmatched': len(unmatched),
+                'unmatched': unmatched if unmatched else None
             }
+        except Exception as e:
+            logger.error(f"Failed to create Spotify playlist: {e}")
+            return {'error': f'Failed to create playlist: {e}'}
 
-        # TODO: Implement real playlist addition
-        pass
-
-    def match_tracks_batch(self, track_ids: List[int]) -> Dict:
-        """
-        Batch match multiple tracks to Spotify.
-
-        Used for pre-populating spotify_uri in tracks table.
-
-        TODO: Activate when Spotify API available
-        """
+    def _mock_create_playlist(self, track_ids: List[int], playlist_name: str) -> Dict:
+        """Fallback: return export data when Spotify isn't authenticated."""
         tracks = Track.query.filter(Track.id.in_(track_ids)).all()
+        track_list = []
+        for track in tracks:
+            track_list.append({
+                'track_id': track.id,
+                'name': track.name,
+                'artist': track.artist.name if track.artist else 'Unknown',
+                'spotify_uri': track.spotify_uri,
+                'search_query': f"{track.name} {track.artist.name if track.artist else ''}"
+            })
 
-        if MOCK_MODE:
-            return {
-                'mock': True,
-                'message': 'Batch matching unavailable',
-                'tracks_requested': len(track_ids),
-                'tracks_matched': 0,
-                'tracks_pending': [
-                    {'id': t.id, 'name': t.name, 'artist': t.artist.name if t.artist else None}
-                    for t in tracks[:10]  # Sample
-                ]
-            }
-
-        # TODO: Implement batch matching with rate limiting
-        # Spotify allows 100 tracks per request to /audio-features
-        # For search, implement with delays to respect rate limits
-        pass
+        return {
+            'mock': True,
+            'status': 'export_ready',
+            'message': 'Connect your Spotify account to create playlists directly.',
+            'playlist_name': playlist_name,
+            'track_count': len(track_list),
+            'tracks': track_list,
+            'instructions': [
+                '1. Open Spotify and create a new playlist',
+                f'2. Name it: {playlist_name}',
+                '3. Search for each track below and add to playlist',
+            ]
+        }
 
 
-def authenticate_spotify(user_id: int) -> Dict:
-    """Convenience function to start Spotify OAuth."""
-    client = SpotifyClient(user_id)
-    return client.authenticate_spotify()
-
+# =========================================================================
+# Module-level convenience functions (used by app.py routes)
+# =========================================================================
 
 def search_track(track_id: int) -> Dict:
-    """
-    Search Spotify for a track from our database.
-
-    Args:
-        track_id: Our internal track ID
-
-    Returns:
-        Spotify match results or mock response
-    """
+    """Search Spotify for a track from our database."""
     track = Track.query.get(track_id)
     if not track:
         return {'error': 'Track not found', 'track_id': track_id}
 
-    # If we already have Spotify URI, return it
+    # Return cached result if we already have a Spotify URI
     if track.spotify_uri:
         return {
             'found': True,
@@ -271,50 +317,63 @@ def search_track(track_id: int) -> Dict:
             'spotify_id': track.spotify_id
         }
 
-    # Search Spotify
-    client = SpotifyClient(None)  # No user needed for search in mock mode
+    client = SpotifyClient()
     artist_name = track.artist.name if track.artist else ''
     result = client.search_track(track.name, artist_name)
 
-    # TODO: When real implementation, store spotify_uri in track record
-    # if result.get('found') and result.get('spotify_uri'):
-    #     track.spotify_uri = result['spotify_uri']
-    #     track.spotify_id = result['spotify_id']
-    #     db.session.commit()
+    # Store result if found
+    if result.get('found') and result.get('spotify_uri'):
+        track.spotify_uri = result['spotify_uri']
+        track.spotify_id = result['spotify_id']
+        if result.get('popularity') is not None:
+            track.spotify_popularity = result['popularity']
+            track.spotify_popularity_updated_at = datetime.utcnow()
+        if result.get('preview_url'):
+            track.spotify_preview_url = result['preview_url']
+        db.session.commit()
 
     return result
 
 
 def create_playlist(user_id: int, track_ids: List[int], playlist_name: str) -> Dict:
-    """Convenience function to create playlist."""
+    """Create a Spotify playlist."""
     client = SpotifyClient(user_id)
     return client.create_playlist(track_ids, playlist_name)
 
 
-def get_spotify_status() -> Dict:
+def get_spotify_status(user_id: int = None) -> Dict:
     """Get current Spotify integration status."""
+    configured = is_spotify_configured()
+    authenticated = False
+
+    if user_id and configured:
+        user = User.query.get(user_id)
+        authenticated = bool(user and user.spotify_access_token)
+
     return {
-        'enabled': not MOCK_MODE,
-        'mock_mode': MOCK_MODE,
-        'status': 'pending' if MOCK_MODE else 'active',
-        'message': 'Spotify integration pending developer access' if MOCK_MODE else 'Connected',
+        'enabled': configured,
+        'mock_mode': not configured,
+        'authenticated': authenticated,
+        'status': (
+            'active' if authenticated else
+            ('configured' if configured else 'pending')
+        ),
+        'message': (
+            'Connected to Spotify' if authenticated else
+            ('Spotify configured - connect your account' if configured else
+             'Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in environment')
+        ),
         'features_available': {
-            'search': not MOCK_MODE,
-            'playback': not MOCK_MODE,
-            'playlist_creation': not MOCK_MODE,
-            'audio_features': not MOCK_MODE
-        },
-        'workaround': 'Export recommendations to JSON for manual Spotify playlist creation' if MOCK_MODE else None
+            'search': configured,
+            'playlist_creation': authenticated,
+            'audio_features': configured,
+            'popularity': configured
+        }
     }
 
 
 def export_for_spotify(track_ids: List[int], format: str = 'json') -> Dict:
-    """
-    Export tracks in a format suitable for manual Spotify import.
-
-    Since direct integration is pending, this provides data users can
-    use to manually create playlists.
-    """
+    """Export tracks in a format suitable for manual Spotify import."""
     tracks = Track.query.filter(Track.id.in_(track_ids)).all()
 
     export_data = []
@@ -325,11 +384,10 @@ def export_for_spotify(track_ids: List[int], format: str = 'json') -> Dict:
             'album': track.album.name if track.album else None,
             'search_query': f"{track.name} - {track.artist.name if track.artist else ''}",
             'lastfm_url': track.url,
-            'spotify_uri': track.spotify_uri  # May be None
+            'spotify_uri': track.spotify_uri
         })
 
     if format == 'text':
-        # Simple text format for easy copy-paste
         lines = [f"{t['name']} - {t['artist']}" for t in export_data]
         return {
             'format': 'text',

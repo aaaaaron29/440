@@ -22,6 +22,11 @@ class User(db.Model):
     total_scrobbles = db.Column(db.Integer, default=0)
     sync_interval_minutes = db.Column(db.Integer, default=30)
 
+    # Spotify OAuth tokens
+    spotify_access_token = db.Column(db.Text, nullable=True)
+    spotify_refresh_token = db.Column(db.Text, nullable=True)
+    spotify_token_expires_at = db.Column(db.DateTime, nullable=True)
+
     # Relationships
     scrobbles = db.relationship('Scrobble', backref='user', lazy='dynamic')
     loved_tracks = db.relationship('LovedTrack', backref='user', lazy='dynamic')
@@ -77,6 +82,11 @@ class Track(db.Model):
     spotify_id = db.Column(db.Text, nullable=True, index=True)
     spotify_uri = db.Column(db.Text, nullable=True)
     isrc = db.Column(db.Text, nullable=True)
+
+    # Spotify popularity (0-100 from Spotify API)
+    spotify_popularity = db.Column(db.Integer, nullable=True)
+    spotify_popularity_updated_at = db.Column(db.DateTime, nullable=True)
+    spotify_preview_url = db.Column(db.Text, nullable=True)
 
     # Relationships
     scrobbles = db.relationship('Scrobble', backref='track', lazy='dynamic')
@@ -305,3 +315,28 @@ def init_db(app):
     db.init_app(app)
     with app.app_context():
         db.create_all()
+
+
+def migrate_db(app):
+    """Add new columns to existing tables if they don't exist.
+
+    SQLite's db.create_all() creates missing tables but does NOT alter
+    existing tables to add new columns. This runs ALTER TABLE statements
+    wrapped in try/except to handle the 'duplicate column' case.
+    """
+    with app.app_context():
+        with db.engine.connect() as conn:
+            migrations = [
+                "ALTER TABLE users ADD COLUMN spotify_access_token TEXT",
+                "ALTER TABLE users ADD COLUMN spotify_refresh_token TEXT",
+                "ALTER TABLE users ADD COLUMN spotify_token_expires_at DATETIME",
+                "ALTER TABLE tracks ADD COLUMN spotify_popularity INTEGER",
+                "ALTER TABLE tracks ADD COLUMN spotify_popularity_updated_at DATETIME",
+                "ALTER TABLE tracks ADD COLUMN spotify_preview_url TEXT",
+            ]
+            for sql in migrations:
+                try:
+                    conn.execute(db.text(sql))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()

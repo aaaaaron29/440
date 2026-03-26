@@ -18,6 +18,12 @@ A Python-based application that tracks your Last.fm listening history for data s
 - Last.fm account
 - Last.fm API key
 
+### Spotify Integration (Limited Access)
+
+> **Important:** This app's Spotify integration is currently in **Development Mode**, which limits OAuth access to a maximum of 5 explicitly approved users. If you clone this repo and want to use Spotify features (playlist creation, audio previews, popularity data), your Spotify email must be manually added to the app's User Management in the [Spotify Developer Dashboard](https://developer.spotify.com/). Without this, Spotify features will fall back to text-based export.
+>
+> To request access, open an issue with your Spotify account email, or set up your own Spotify app credentials in a `.env` file (see [Spotify Setup](#spotify-setup) below).
+
 ## Getting Your Last.fm API Key
 
 1. Go to [Last.fm API Account Creation](https://www.last.fm/api/account/create)
@@ -151,6 +157,24 @@ On first sync, the app fetches up to 50 pages (~10,000 scrobbles) of history. To
 # In config.py
 INITIAL_BACKFILL_PAGES = 100  # Fetch ~20,000 scrobbles initially
 ```
+
+## Spotify Setup
+
+To use Spotify features with your own credentials:
+
+1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard) and create a new app
+2. Under app settings, check **Web API** and add `http://127.0.0.1:5000/api/spotify/callback` as a Redirect URI
+3. Create a `.env` file in the project root:
+
+```env
+SPOTIFY_CLIENT_ID=your_client_id
+SPOTIFY_CLIENT_SECRET=your_client_secret
+```
+
+4. Add your Spotify email to the app's **User Management** in the dashboard (required for Development mode)
+5. Restart the app and click "Connect Spotify" on the Discover page
+
+**Note:** Spotify Development mode only allows up to 5 approved users. Use `127.0.0.1` (not `localhost`) for the redirect URI.
 
 ## Running as a Background Service (Windows)
 
